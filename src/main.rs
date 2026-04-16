@@ -178,15 +178,67 @@ fn write_page(src: &Document, page_num: u32, half: Option<Half>, out: &Path) -> 
             .next()
             .ok_or_else(|| anyhow!("対象ページが取得できませんでした (page {page_num})"))?;
         let original = resolve_media_box(&doc, page_id)?;
-        let new_box = compute_half(original, h);
+        // ページに /Rotate が設定されていると、表示上の上下左右と raw 座標が
+        // ずれるため、ユーザー指定の半分を raw 座標系の半分に変換する
+        let rotation = resolve_rotation(&doc, page_id);
+        let raw_half = translate_half_for_rotation(h, rotation);
+        let new_box = compute_half(original, raw_half);
         set_page_box(&mut doc, page_id, new_box)?;
     }
 
     doc.prune_objects();
+    doc.renumber_objects();
+    // lopdfはsave時に元trailerの /Prev /XRefStm を残してしまうため、
+    // 書き出し前にクリアしないと再読込時に cross-reference が壊れる
+    doc.trailer.remove(b"Prev");
+    doc.trailer.remove(b"XRefStm");
     doc.compress();
     doc.save(out)
         .with_context(|| format!("保存失敗: {}", out.display()))?;
     Ok(())
+}
+
+fn resolve_rotation(doc: &Document, page_id: ObjectId) -> i64 {
+    let mut current = page_id;
+    loop {
+        let Ok(obj) = doc.get_object(current) else { return 0; };
+        let Ok(dict) = obj.as_dict() else { return 0; };
+        if let Ok(r) = dict.get(b"Rotate") {
+            if let Ok(n) = r.as_i64() {
+                return ((n % 360) + 360) % 360;
+            }
+        }
+        match dict.get(b"Parent").and_then(|p| p.as_reference()) {
+            Ok(parent) => current = parent,
+            Err(_) => return 0,
+        }
+    }
+}
+
+/// PDFの /Rotate は「表示時に時計回りに回転させる角度」なので、
+/// 表示上のLeft/Right/Top/Bottomを raw 座標系のどの半分に対応させるかを変換する。
+fn translate_half_for_rotation(half: Half, rotation: i64) -> Half {
+    match rotation {
+        90 => match half {
+            Half::Left => Half::Bottom,
+            Half::Right => Half::Top,
+            Half::Top => Half::Left,
+            Half::Bottom => Half::Right,
+        },
+        180 => match half {
+            Half::Left => Half::Right,
+            Half::Right => Half::Left,
+            Half::Top => Half::Bottom,
+            Half::Bottom => Half::Top,
+        },
+        270 => match half {
+            Half::Left => Half::Top,
+            Half::Right => Half::Bottom,
+            Half::Top => Half::Right,
+            Half::Bottom => Half::Left,
+        },
+        _ => half,
+    }
 }
 
 fn resolve_media_box(doc: &Document, page_id: ObjectId) -> Result<[f64; 4]> {
